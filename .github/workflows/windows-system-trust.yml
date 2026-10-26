@@ -1,0 +1,91 @@
+name: Windows System Trust Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-system-trust-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache Rust dependencies and build output
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: windows-system-trust-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: windows-system-trust-
+
+      - name: Install native build prerequisites
+        run: |
+          choco install strawberryperl make --no-progress --yes
+          if ($LASTEXITCODE -ne 0) { throw 'Native build prerequisites failed.' }
+
+      - name: Install and build frontend
+        run: |
+          bun install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { throw 'Frontend dependency installation failed.' }
+          bun run build
+          if ($LASTEXITCODE -ne 0) { throw 'Frontend build failed.' }
+
+      - name: Verify locked Windows certificate feature
+        run: |
+          $features = & cargo tree --locked --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --edges features --invert tokio-tungstenite
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency validation failed.' }
+          $features | Write-Output
+          if (($features | Out-String) -notmatch 'rustls-tls-native-roots') {
+            throw 'Windows system certificate roots are not enabled.'
+          }
+
+      - name: Build credential-free WebSocket diagnostic
+        run: |
+          cargo build --locked --release --manifest-path src-tauri/Cargo.toml --example websocket_trust_check
+          if ($LASTEXITCODE -ne 0) { throw 'WebSocket diagnostic build failed.' }
+
+      - name: Upload WebSocket diagnostic
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-websocket-trust-check
+          path: src-tauri/target/release/examples/websocket_trust_check.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Build Windows app and installer without updater signing
+        run: |
+          bun run tauri build --bundles nsis --config src-tauri/ci.conf.json -- --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Windows application build failed.' }
+
+      - name: Upload patched Windows app and installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: iloader-windows-system-trust
+          path: |
+            src-tauri/target/release/iloader.exe
+            src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Confirm lockfile was unchanged
+        run: git diff --exit-code -- src-tauri/Cargo.lock
